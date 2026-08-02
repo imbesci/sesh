@@ -25,7 +25,7 @@ from .paths import TranscriptFile, index_file, list_transcripts
 from .scan import ScanInput, scan_session
 from .types import SessionMeta, meta_from_dict, meta_to_dict
 
-INDEX_VERSION = 5
+INDEX_VERSION = 7
 
 #: Concurrent transcript readers. Parsing holds the GIL, but reading does not,
 #: so a handful of workers still overlaps IO with parse work.

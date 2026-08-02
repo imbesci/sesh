@@ -113,10 +113,20 @@ def plan_resume(
 
     if cwd is not None:
         target_cwd = cwd
-        if encode_project_dir(target_cwd) != session.project_dir:
-            warnings.append(
-                "Resuming from a different project directory than the session was created in. "
-                "Claude Code scopes session lookup by directory, so this may fail."
+        if not fork and encode_project_dir(target_cwd) != session.project_dir:
+            # Not "may fail": Claude Code locates a session by its *encoded* cwd,
+            # so from a directory that encodes to a different project name the
+            # resume is guaranteed to return "No conversation found". Refuse
+            # before launching a doomed command, and name the one that resolves.
+            working = best_resume_cwd(session)
+            if working is not None and working.exists:
+                raise ResumeError(
+                    "The current directory won't resolve this session -- Claude Code finds "
+                    f"sessions by directory. Press enter to resume from {working.cwd}."
+                )
+            raise ResumeError(
+                "The current directory won't resolve this session, and its own directory "
+                f"({session.origin_cwd or 'unknown'}) no longer exists."
             )
     else:
         target = best_resume_cwd(session)

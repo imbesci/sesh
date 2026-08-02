@@ -37,6 +37,8 @@ MAX_PROMPTS = 120
 MAX_PROMPT_CHARS = 300
 #: Bound on distinct touched files retained per session.
 MAX_FILES = 80
+#: Bound on characters retained for Claude's last message.
+MAX_LEFTOFF_CHARS = 280
 
 _SYSTEM_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 _LOCAL_STDOUT = re.compile(r"<local-command-stdout>.*?</local-command-stdout>", re.DOTALL)
@@ -168,6 +170,37 @@ def typed_prompt_text(content: object) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+#: Tool-input keys that best identify what a call did, tried in order. A path
+#: names the target; a command/pattern/prompt is the payload; anything else
+#: falls back to the bare tool name.
+_TOOL_PATH_KEYS = ("file_path", "notebook_path", "path")
+_TOOL_PAYLOAD_KEYS = ("command", "pattern", "query", "description", "prompt", "url")
+
+
+def describe_tool_use(name: str | None, params: dict | None) -> str:
+    """A compact one-liner for a single ``tool_use`` block, for "last action".
+
+    "Edit view.py" and "Bash: git commit -m …" carry the state of a session at a
+    glance; the raw JSON does not. File tools are keyed by their target's
+    basename (the full path lives in ``files``); command-shaped tools show a
+    trimmed snippet of what they ran.
+    """
+    label = name or "tool"
+    if not params:
+        return label
+    for key in _TOOL_PATH_KEYS:
+        path = as_str(params.get(key))
+        if path:
+            return f"{label} {os.path.basename(path.rstrip('/')) or path}"
+    for key in _TOOL_PAYLOAD_KEYS:
+        value = as_str(params.get(key))
+        if value:
+            snippet = _WHITESPACE.sub(" ", value).strip()
+            if snippet:
+                return f"{label}: {snippet[:60]}"
+    return label
+
+
 @dataclass(slots=True)
 class ScanInput:
     path: str
@@ -200,11 +233,19 @@ def scan_session(source: ScanInput) -> SessionMeta:
     version: str | None = None
     ai_title: str | None = None
     last_prompt_record: str | None = None
+    last_assistant_text: str | None = None
+    last_action: str | None = None
     compacted = False
     session_id = source.id
     origin_cwd = ""
     sidechain_records = 0
     prompts_truncated = False
+    # The last thing that happened on the main thread, for the "unfinished"
+    # signal: "assistant_text" (Claude wrapped up), "assistant_tool"/"tool_result"
+    # (mid-action), "user" (asked, unanswered). Updated in record order.
+    last_event: str | None = None
+    #: First session id seen in the stream, to spot a forked/continued transcript.
+    first_session_id: str | None = None
 
     try:
         with open(source.path, encoding="utf8", errors="replace") as handle:
@@ -270,6 +311,8 @@ def scan_session(source: ScanInput) -> SessionMeta:
                     version = found_version
                 found_id = as_str(record.get("sessionId"))
                 if found_id:
+                    if first_session_id is None:
+                        first_session_id = found_id
                     session_id = found_id
 
                 message = as_dict(record.get("message"))
@@ -289,31 +332,68 @@ def scan_session(source: ScanInput) -> SessionMeta:
                                 input_tokens += value
 
                     content = message.get("content")
+                    # "Where you left off": the main thread's final words and
+                    # final action. Subagent turns are excluded -- a fan-out
+                    # worker's last message is not where *this* session ended.
+                    # Records stream in order, so the last overwrite wins.
+                    text_parts: list[str] = []
+                    # Which kind of block the turn ended on -- Claude typically
+                    # emits text then tool calls, so a trailing tool_use means it
+                    # signed off by acting, not by concluding.
+                    final_block_kind: str | None = None
                     if isinstance(content, list):
                         for raw_block in content:
                             block = as_dict(raw_block)
-                            if block is None or block.get("type") != "tool_use":
+                            if block is None:
                                 continue
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                snippet = as_str(block.get("text"))
+                                if snippet and snippet.strip():
+                                    text_parts.append(snippet.strip())
+                                    final_block_kind = "text"
+                                continue
+                            if block_type != "tool_use":
+                                continue
+                            final_block_kind = "tool_use"
                             tool_calls += 1
                             name = as_str(block.get("name"))
                             if name:
                                 tools[name] = tools.get(name, 0) + 1
+                            params = as_dict(block.get("input"))
+                            if not is_sidechain:
+                                last_action = describe_tool_use(name, params)
                             # Touched-file paths make "which session edited X?"
                             # answerable instantly, without a content grep.
-                            if len(files) < MAX_FILES:
-                                params = as_dict(block.get("input"))
-                                if params is not None:
-                                    path = as_str(params.get("file_path")) or as_str(
-                                        params.get("notebook_path")
-                                    )
-                                    if path:
-                                        files[path] = None
+                            if len(files) < MAX_FILES and params is not None:
+                                path = as_str(params.get("file_path")) or as_str(
+                                    params.get("notebook_path")
+                                )
+                                if path:
+                                    files[path] = None
+                    elif isinstance(content, str) and content.strip():
+                        text_parts.append(content.strip())
+                        final_block_kind = "text"
+
+                    if not is_sidechain:
+                        if text_parts:
+                            last_assistant_text = _WHITESPACE.sub(
+                                " ", " ".join(text_parts)
+                            ).strip()[:MAX_LEFTOFF_CHARS]
+                        if final_block_kind == "tool_use":
+                            last_event = "assistant_tool"
+                        elif final_block_kind == "text":
+                            last_event = "assistant_text"
                     continue
 
                 if record_type == "user" and message is not None and not is_sidechain:
                     # Structural filters first: tool results and injected meta
                     # records are not things the human typed.
-                    if "toolUseResult" in record or record.get("isMeta") is True:
+                    if "toolUseResult" in record:
+                        # A tool came back but Claude has not (yet) responded.
+                        last_event = "tool_result"
+                        continue
+                    if record.get("isMeta") is True:
                         continue
 
                     text = typed_prompt_text(message.get("content"))
@@ -324,6 +404,7 @@ def scan_session(source: ScanInput) -> SessionMeta:
                     if _is_empty_prompt(cleaned):
                         continue
 
+                    last_event = "user"
                     if len(prompts) < MAX_PROMPTS:
                         prompts.append(
                             PromptEntry(
@@ -351,6 +432,15 @@ def scan_session(source: ScanInput) -> SessionMeta:
     last_branch = max(branch_stats, key=lambda b: b.last_seen).name if branch_stats else None
 
     tool_stats = [ToolStat(name=name, count=count) for name, count in sorted(tools.items(), key=lambda kv: -kv[1])]
+
+    ended_mid_action = last_event in ("assistant_tool", "tool_result")
+    # A parent id only counts when the stream also *became* this session -- the
+    # early records belong to an ancestor, the later ones to us.
+    forked_from = (
+        first_session_id
+        if first_session_id and first_session_id != session_id and session_id == source.id
+        else None
+    )
 
     return SessionMeta(
         id=session_id,
@@ -385,6 +475,10 @@ def scan_session(source: ScanInput) -> SessionMeta:
         mtime=source.mtime,
         has_subagents=Path(subagent_dir(source.path)).exists(),
         compacted=compacted,
+        ended_mid_action=ended_mid_action,
+        forked_from=forked_from,
+        last_assistant_text=last_assistant_text,
+        last_action=last_action,
         live=None,
     )
 

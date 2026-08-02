@@ -96,11 +96,28 @@ class PlanResume(unittest.TestCase):
         with self.assertRaises(ResumeError):
             plan_resume(meta)
 
-    def test_warns_when_override_directory_would_not_resolve(self):
+    def test_refuses_override_directory_that_cannot_resolve(self):
+        # A cwd that encodes to a different project name is a guaranteed
+        # "No conversation found", so sesh refuses and points at the directory
+        # that works rather than launching a doomed command.
         with RealDirSession() as fixture:
-            plan = plan_resume(fixture.meta, cwd="/some/other/place")
+            with self.assertRaises(ResumeError) as caught:
+                plan_resume(fixture.meta, cwd="/some/other/place")
+            self.assertIn(fixture.dir, str(caught.exception))
+
+    def test_refusal_notes_when_own_directory_is_also_gone(self):
+        meta = session(origin_cwd="/gone/origin", project_dir="-gone-origin", cwds=[])
+        with self.assertRaises(ResumeError) as caught:
+            plan_resume(meta, cwd="/some/other/place")
+        self.assertIn("no longer exists", str(caught.exception))
+
+    def test_fork_from_another_directory_is_still_allowed(self):
+        # Forking writes a new session in the current directory, so a mismatch
+        # is intentional there and must not be blocked.
+        with RealDirSession() as fixture:
+            plan = plan_resume(fixture.meta, cwd="/some/other/place", fork=True)
             self.assertEqual(plan.cwd, "/some/other/place")
-            self.assertIn("scopes session lookup by directory", " ".join(plan.warnings))
+            self.assertIn("--fork-session", plan.args)
 
     def test_warns_when_session_is_already_open(self):
         live = LiveSession(

@@ -1,6 +1,6 @@
 import unittest
 
-from sesh.core.format import bytes_, duration, number, relative_time, short_path
+from sesh.core.format import bytes_, duration, number, relative_time, short_path, time_bucket
 from sesh.tui.ansi import display_width, fit, paint, set_color_enabled, truncate
 from sesh.tui.term import decode_keys
 
@@ -116,6 +116,16 @@ class Formatting(unittest.TestCase):
         self.assertEqual(number(250), "250")
         self.assertEqual(number(88_000), "88k")
         self.assertEqual(number(1_250_000), "1.3M")
+
+    def test_time_bucket_is_calendar_based(self):
+        day = 86400
+        self.assertEqual(time_bucket(self.NOW - 10, self.NOW), "Today")
+        self.assertEqual(time_bucket(self.NOW - day, self.NOW), "Yesterday")
+        self.assertEqual(time_bucket(self.NOW - 3 * day, self.NOW), "Past week")
+        self.assertEqual(time_bucket(self.NOW - 20 * day, self.NOW), "Past month")
+        self.assertEqual(time_bucket(self.NOW - 100 * day, self.NOW), "Past year")
+        self.assertEqual(time_bucket(self.NOW - 500 * day, self.NOW), "Older")
+        self.assertEqual(time_bucket(0, self.NOW), "Older")
 
     def test_duration_reads_naturally(self):
         self.assertEqual(duration(self.NOW, self.NOW + 30), "<1m")

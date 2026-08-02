@@ -103,6 +103,29 @@ def restore_trash(entry: TrashEntry) -> None:
         raise ActionError(f"Could not restore session: {err}") from err
 
 
+def editor_command(path: str) -> list[str] | None:
+    """The argv to open ``path`` in the user's editor, or None if none is found.
+
+    Honours ``$VISUAL``/``$EDITOR`` first (they may carry flags, e.g. ``code
+    -w``), then falls back to common GUI editors, then the OS opener. Returns
+    None so callers can report "no editor" rather than launching nothing.
+    """
+    import shlex
+
+    for var in ("VISUAL", "EDITOR"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return shlex.split(value) + [path]
+    for candidate in ("code", "cursor", "subl", "zed"):
+        if shutil.which(candidate):
+            return [candidate, path]
+    if sys.platform == "darwin":
+        return ["open", path]
+    if shutil.which("xdg-open"):
+        return ["xdg-open", path]
+    return None
+
+
 def copy_to_clipboard(text: str) -> bool:
     """Copy text to the system clipboard.
 

@@ -1,6 +1,6 @@
 import unittest
 
-from sesh.core.scan import clean_prompt_text, scan_path
+from sesh.core.scan import clean_prompt_text, describe_tool_use, scan_path
 
 from .fixtures import Transcript, assistant_message, tool_result, user_prompt
 
@@ -146,6 +146,151 @@ class ScanSession(unittest.TestCase):
             meta = scan_path(fixture.path)
 
         self.assertEqual(sorted(meta.files), ["/repo/api/README.md", "/repo/api/src/auth.py"])
+
+
+class LeftOff(unittest.TestCase):
+    def test_captures_last_message_and_action(self):
+        with Transcript(
+            [
+                user_prompt("fix the auth bug"),
+                assistant_message([{"type": "text", "text": "Looking into it."}]),
+                assistant_message(
+                    [
+                        {"type": "text", "text": "Fixed it and committed the change."},
+                        {"type": "tool_use", "name": "Bash", "input": {"command": "git commit -m 'fix auth'"}},
+                    ]
+                ),
+            ]
+        ) as fixture:
+            meta = scan_path(fixture.path)
+
+        # The last turn's words and its final action, not an earlier turn's.
+        self.assertEqual(meta.last_assistant_text, "Fixed it and committed the change.")
+        self.assertEqual(meta.last_action, "Bash: git commit -m 'fix auth'")
+
+    def test_last_action_survives_a_final_text_only_turn(self):
+        # Claude often ends by summarising after its last tool call; the action
+        # should still reflect what it actually did.
+        with Transcript(
+            [
+                user_prompt("edit the file"),
+                assistant_message([{"type": "tool_use", "name": "Edit", "input": {"file_path": "/repo/api/view.py"}}]),
+                assistant_message([{"type": "text", "text": "Done."}]),
+            ]
+        ) as fixture:
+            meta = scan_path(fixture.path)
+
+        self.assertEqual(meta.last_action, "Edit view.py")
+        self.assertEqual(meta.last_assistant_text, "Done.")
+
+    def test_ignores_subagent_turns(self):
+        # A fan-out worker's last words are not where the main session ended.
+        records = [
+            user_prompt("delegate the work"),
+            assistant_message([{"type": "text", "text": "Main thread signing off."}]),
+            assistant_message([{"type": "text", "text": "subagent chatter"}], isSidechain=True),
+            assistant_message(
+                [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x.py"}}], isSidechain=True
+            ),
+        ]
+        with Transcript(records) as fixture:
+            meta = scan_path(fixture.path)
+
+        self.assertEqual(meta.last_assistant_text, "Main thread signing off.")
+        self.assertIsNone(meta.last_action)
+
+    def test_no_assistant_turns_leaves_fields_empty(self):
+        with Transcript([user_prompt("just a question")]) as fixture:
+            meta = scan_path(fixture.path)
+
+        self.assertIsNone(meta.last_assistant_text)
+        self.assertIsNone(meta.last_action)
+
+
+class EndedMidAction(unittest.TestCase):
+    def test_wrapping_up_with_text_is_finished(self):
+        with Transcript(
+            [
+                user_prompt("do it"),
+                assistant_message([{"type": "tool_use", "name": "Edit", "input": {"file_path": "/a.py"}}]),
+                tool_result("ok"),
+                assistant_message([{"type": "text", "text": "All done."}]),
+            ]
+        ) as fixture:
+            self.assertFalse(scan_path(fixture.path).ended_mid_action)
+
+    def test_ending_on_a_tool_call_is_unfinished(self):
+        with Transcript(
+            [
+                user_prompt("do it"),
+                assistant_message(
+                    [{"type": "text", "text": "Running…"},
+                     {"type": "tool_use", "name": "Bash", "input": {"command": "make"}}]
+                ),
+            ]
+        ) as fixture:
+            self.assertTrue(scan_path(fixture.path).ended_mid_action)
+
+    def test_dangling_tool_result_is_unfinished(self):
+        # Tool came back, Claude never responded -- classic "I quit while it thought".
+        with Transcript(
+            [
+                user_prompt("do it"),
+                assistant_message([{"type": "tool_use", "name": "Bash", "input": {"command": "make"}}]),
+                tool_result("build output"),
+            ]
+        ) as fixture:
+            self.assertTrue(scan_path(fixture.path).ended_mid_action)
+
+    def test_unanswered_prompt_is_not_flagged(self):
+        # A freshly-typed prompt with no response yet should not count as WIP.
+        with Transcript([user_prompt("a question")]) as fixture:
+            self.assertFalse(scan_path(fixture.path).ended_mid_action)
+
+    def test_subagent_activity_does_not_decide_finishedness(self):
+        with Transcript(
+            [
+                user_prompt("delegate"),
+                assistant_message([{"type": "text", "text": "Signing off."}]),
+                assistant_message(
+                    [{"type": "tool_use", "name": "Bash", "input": {"command": "x"}}], isSidechain=True
+                ),
+            ]
+        ) as fixture:
+            self.assertFalse(scan_path(fixture.path).ended_mid_action)
+
+
+class ForkedFrom(unittest.TestCase):
+    def test_uniform_session_id_is_not_a_fork(self):
+        with Transcript([user_prompt("hi"), assistant_message([{"type": "text", "text": "yo"}])]) as fixture:
+            self.assertIsNone(scan_path(fixture.path).forked_from)
+
+    def test_earlier_parent_id_is_detected(self):
+        # Early records carry a parent's id; later records carry this file's id.
+        with Transcript(
+            [
+                user_prompt("copied history", sessionId="parent-id"),
+                assistant_message([{"type": "text", "text": "continued"}], sessionId="s1"),
+            ]
+        ) as fixture:
+            self.assertEqual(scan_path(fixture.path).forked_from, "parent-id")
+
+
+class DescribeToolUse(unittest.TestCase):
+    def test_file_tools_use_basename(self):
+        self.assertEqual(describe_tool_use("Edit", {"file_path": "/repo/api/src/auth.py"}), "Edit auth.py")
+
+    def test_command_tools_show_trimmed_payload(self):
+        self.assertEqual(describe_tool_use("Bash", {"command": "  git   status  "}), "Bash: git status")
+
+    def test_long_payload_is_capped(self):
+        described = describe_tool_use("Bash", {"command": "x" * 200})
+        self.assertTrue(described.startswith("Bash: "))
+        self.assertLessEqual(len(described), len("Bash: ") + 60)
+
+    def test_falls_back_to_bare_name(self):
+        self.assertEqual(describe_tool_use("TodoWrite", {"todos": []}), "TodoWrite")
+        self.assertEqual(describe_tool_use(None, None), "tool")
 
 
 class SyntheticPromptFiltering(unittest.TestCase):

@@ -13,6 +13,7 @@ from ..core.format import (
     relative_time,
     short_model,
     short_path,
+    time_bucket,
 )
 from ..core.query import QueryHit
 from ..core.resume import best_resume_cwd
@@ -132,6 +133,21 @@ def _snippet_around(text: str, positions: list[int], width: int) -> tuple[str, l
     return prefix + body, moved
 
 
+def bucket_header_before(hits: list[QueryHit], index: int, now: float) -> str | None:
+    """The time-bucket label to draw above row ``index``, or None.
+
+    A header appears at the first row and wherever the calendar bucket changes.
+    Shared by the renderer and the scroll-height calculation so the two never
+    disagree about how tall a row is.
+    """
+    if not (0 <= index < len(hits)):
+        return None
+    label = time_bucket(hits[index].session.ended_at, now)
+    if index == 0 or time_bucket(hits[index - 1].session.ended_at, now) != label:
+        return label
+    return None
+
+
 def render_rows(
     hits: list[QueryHit],
     start: int,
@@ -141,18 +157,28 @@ def render_rows(
     layout: ListLayout,
     has_query: bool,
     now: float,
+    group_by_time: bool = False,
 ) -> list[str]:
     """Render list rows.
 
     A row is normally one line; when a query matched something other than the
     visible title, a dim second line shows the matching snippet so the user can
-    see *why* the row is in the list.
+    see *why* the row is in the list. Under time grouping, a thin ``Today`` /
+    ``Yesterday`` header precedes the first row of each calendar bucket.
     """
     lines: list[str] = []
 
     for index in range(start, len(hits)):
         if len(lines) >= height:
             break
+
+        if group_by_time:
+            header = bucket_header_before(hits, index, now)
+            if header is not None:
+                lines.append(paint(fit("  " + header, width), fg=Theme.faint, bold=True))
+                if len(lines) >= height:
+                    break
+
         hit = hits[index]
         session = hit.session
         selected = index == cursor
@@ -244,6 +270,8 @@ def render_chips(view: ViewState, anchor: Anchor, width: int) -> str:
         left += chip("branch", view.branch_filter, True)
     if view.repo_filter:
         left += chip("repo", view.repo_filter.rsplit("/", 1)[-1], True)
+    if view.related_to is not None:
+        left += chip("related", "this task", True)
     if not view.hide_empty:
         left += paint("  +empty", fg=Theme.faint)
 
@@ -344,11 +372,15 @@ def render_preview(
         stats.append("compacted")
     if session.has_subagents:
         stats.append("subagents")
+    if session.ended_mid_action:
+        stats.append("unfinished")
     field("stats", "  ·  ".join(stats), fg=Theme.muted)
 
     if session.models:
         field("model", ", ".join(short_model(m) for m in session.models), fg=Theme.muted)
     field("id", session.id, fg=Theme.faint)
+    if session.forked_from:
+        field("forked", f"from {session.forked_from[:8]}", fg=Theme.faint)
 
     if session.tools:
         field("tools", "  ".join(f"{t.name}·{t.count}" for t in session.tools[:5]), fg=Theme.faint)
@@ -358,6 +390,16 @@ def render_preview(
         add(paint(f"files ({len(session.files)})", fg=Theme.faint))
         for path in session.files[:6]:
             add(paint(truncate(short_path(path, HOME, inner - 2), inner - 2), fg=Theme.muted))
+
+    # Where the session ended up -- the complement to the prompts below. The
+    # prompts say what was asked; this says what came of it.
+    if session.last_assistant_text or session.last_action:
+        add("")
+        lines.append(rule(width, "left off"))
+        if session.last_action:
+            field("last", session.last_action, fg=Theme.branch)
+        for line in wrap_text(session.last_assistant_text or "", inner)[:4]:
+            add(paint(line, fg=Theme.muted))
 
     if session.prompts:
         add("")

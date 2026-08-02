@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 
 from sesh.core.types import BranchStat, CwdStat, LiveSession
-from sesh.core.view import branches_in, compute_view, default_view, projects_in
+from sesh.core.view import branches_in, compute_view, default_view, is_related, projects_in
 
 from .fixtures import NOW, anchor, session
 
@@ -106,7 +106,8 @@ class Ordering(unittest.TestCase):
         view = replace(default_view(anchor()), scope="all", query="kerberos", sort="oldest")
         self.assertEqual(ids(compute_view([first, second], view, anchor(), NOW)), ["a", "b"])
 
-    def test_running_sessions_float_to_top(self):
+    def test_idle_running_session_does_not_float_to_top(self):
+        """Liveness is not recency: an idle process sorts by its last activity."""
         live = session(
             id="live",
             ended_at=NOW - 10_000_000,
@@ -117,7 +118,13 @@ class Ordering(unittest.TestCase):
         )
         recent = session(id="recent", ended_at=NOW)
         view = replace(default_view(anchor()), scope="all")
-        self.assertEqual(ids(compute_view([recent, live], view, anchor(), NOW))[0], "live")
+        self.assertEqual(ids(compute_view([recent, live], view, anchor(), NOW)), ["recent", "live"])
+
+    def test_unfinished_sort_floats_mid_action_sessions(self):
+        done_new = session(id="done", ended_at=NOW, ended_mid_action=False)
+        wip_old = session(id="wip", ended_at=NOW - 100_000, ended_mid_action=True)
+        view = replace(default_view(anchor()), scope="all", sort="unfinished")
+        self.assertEqual(ids(compute_view([done_new, wip_old], view, anchor(), NOW)), ["wip", "done"])
 
     def test_empty_sessions_hidden_but_reachable(self):
         empty = session(id="empty", turns=0, prompts=[])
@@ -131,6 +138,37 @@ class Ordering(unittest.TestCase):
         view = replace(default_view(anchor()), scope="all", query="alpha")
         result = compute_view([first, second], view, anchor(), NOW)
         self.assertEqual((len(result.hits), result.in_scope_count, result.total_count), (1, 2, 2))
+
+
+class Related(unittest.TestCase):
+    def test_same_repo_and_branch_is_related(self):
+        ref = session(id="ref", branches=[BranchStat(name="main", count=5, last_seen=NOW)])
+        sibling = session(id="sib", branches=[BranchStat(name="main", count=2, last_seen=NOW)])
+        self.assertTrue(is_related(sibling, ref))
+
+    def test_same_repo_different_branch_is_not_related(self):
+        ref = session(id="ref", branches=[BranchStat(name="main", count=5, last_seen=NOW)])
+        other = session(id="other", branches=[BranchStat(name="feature", count=5, last_seen=NOW)])
+        self.assertFalse(is_related(other, ref))
+
+    def test_shared_file_across_repos_is_related(self):
+        ref = session(id="ref", files=["/repo/api/auth.py"])
+        elsewhere = session(
+            id="elsewhere", repo_key="/repo/web", repo_name="web", origin_cwd="/repo/web",
+            branches=[BranchStat(name="trunk", count=1, last_seen=NOW)], files=["/repo/api/auth.py"],
+        )
+        self.assertTrue(is_related(elsewhere, ref))
+
+    def test_related_mode_ignores_scope(self):
+        # A sibling on another branch is out of a branch scope, but related mode
+        # must surface it anyway.
+        ref = session(id="ref", branches=[BranchStat(name="main", count=5, last_seen=NOW)], files=["/x.py"])
+        sibling = session(
+            id="sib", branches=[BranchStat(name="feature", count=5, last_seen=NOW)], files=["/x.py"]
+        )
+        unrelated = session(id="nope", repo_key="/repo/web", repo_name="web", origin_cwd="/repo/web", files=[])
+        view = replace(default_view(anchor()), scope="branch", related_to="ref")
+        self.assertEqual(sorted(ids(compute_view([ref, sibling, unrelated], view, anchor(), NOW))), ["ref", "sib"])
 
 
 class Facets(unittest.TestCase):

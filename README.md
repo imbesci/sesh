@@ -62,6 +62,8 @@ sesh                   # picker, scoped to the current branch
 sesh --safe            # same, but resume with permission prompts left on
 sesh auth redirect     # picker with a filter already applied
 sesh --last            # resume the most recent session here, no UI
+sesh is:unfinished     # sessions you left mid-action
+sesh --open            # open the best match's directory in $EDITOR
 sesh --list --all      # print every session
 sesh --print           # print the resume command for the best match
 ```
@@ -107,7 +109,7 @@ matched on something other than its title, the reason is shown beneath it:
 | `dir:` `tool:` `model:` `id:` | working directory, tool used, model, session id |
 | `age:7d` `after:2026-07-01` `before:` | time windows |
 | `turns:>5` `tokens:>100k` `records:` | numeric comparisons |
-| `is:live` `is:compacted` `is:subagents` | state |
+| `is:live` `is:unfinished` `is:compacted` | state; also `is:subagents`, `is:fork`, `is:empty` |
 | `text:"cannot read"` | search inside full transcripts, not just prompts |
 | `'exact` | literal substring instead of fuzzy |
 | `!term` | exclude |
@@ -127,11 +129,13 @@ mentioned once, a command buried in tool output.
 | `ctrl+o` | resume from the current directory instead |
 | `tab` / `shift+tab` | widen / narrow the scope |
 | `ctrl+b` `ctrl+r` | filter by branch / project |
+| `alt+r` | show sessions related to this one (same task) |
 | `ctrl+s` | cycle sort |
 | `ctrl+g` | show sessions with no prompts |
 | `ctrl+v` | open the full transcript; `/` searches inside it |
 | `ctrl+t`, `alt+↑` `alt+↓` | toggle and scroll the detail pane |
 | `ctrl+y` / `alt+y` | copy the resume command / session id |
+| `alt+o` | open the session's directory in `$EDITOR` |
 | `ctrl+x` / `alt+u` | move a session to trash / undo |
 | `ctrl+l` | reload from disk |
 | `alt+h` | all keys |
@@ -151,9 +155,32 @@ touched and filters on all of them, so a session you started on `main` and
 finished on `fix/auth` is findable from either. Linked worktrees are folded onto
 their parent repo, so a worktree-per-branch layout still reads as one project.
 
-**Running sessions are marked** with `●` and sorted to the top. Resuming one
-warns first: two processes writing one transcript interleave their messages.
-`ctrl+f` forks instead, which is usually what you wanted.
+**Running sessions are marked** with `●`, but they are not floated to the top:
+a `claude` left open in a terminal for days is not "recent", and hoisting it
+above a session you touched minutes ago makes the age column read as mis-sorted.
+They rank by their real activity like everything else. Resuming one warns first:
+two processes writing one transcript interleave their messages. `ctrl+f` forks
+instead, which is usually what you wanted.
+
+**Every row shows where it left off.** The detail pane carries Claude's last
+message and last action alongside the prompts you typed — the prompts say what
+you asked, this says what came of it, which is usually how you recognise the
+session you meant. Both are searchable, so a plain query matches Claude's own
+last words, not just your prompts.
+
+**Unfinished work is findable.** A session whose last event was a tool call or
+its result — rather than a closing message — was interrupted mid-action.
+`is:unfinished` lists exactly those, and `ctrl+s` has a matching sort that floats
+them up. It is the "what did I leave hanging?" list.
+
+**A task is rarely one session.** You stop for the day and start fresh tomorrow,
+or split work across two windows. `alt+r` pivots to the sessions that share this
+one's task — same repo and branch, or the same files touched — across whatever
+scope they live in. `esc` returns to the full list.
+
+**The recent list is grouped by day.** Under the default recency sort, thin
+`Today` / `Yesterday` / `Past week` headers break up the list so a date is a
+glance, not arithmetic. Any other sort or an active query removes them.
 
 **Deleting is reversible.** `ctrl+x` moves a session's files to
 `~/.claude/sesh/trash`; `alt+u` puts them back. Nothing is unlinked. (To

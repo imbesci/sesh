@@ -22,7 +22,7 @@ from .query import ParsedQuery, QueryContext, QueryHit, evaluate, parse_query
 from .types import SessionMeta
 
 SCOPE_ORDER = ("branch", "repo", "dir", "all")
-SORT_ORDER = ("recent", "relevance", "turns", "tokens", "size", "oldest", "title")
+SORT_ORDER = ("recent", "relevance", "unfinished", "turns", "tokens", "size", "oldest", "title")
 
 
 @dataclass(slots=True)
@@ -46,6 +46,9 @@ class ViewState:
     repo_filter: str | None = None
     #: Hide sessions with no typed prompts -- usually accidental launches.
     hide_empty: bool = True
+    #: When set, show only sessions related to this session id (same task),
+    #: ignoring scope. Cleared by esc or by toggling off.
+    related_to: str | None = None
 
 
 def default_view(anchor: Anchor) -> ViewState:
@@ -98,12 +101,34 @@ def _in_scope(session: SessionMeta, view: ViewState, anchor: Anchor) -> bool:
     return repo_ok and any(b.name == branch for b in session.branches)
 
 
+def is_related(session: SessionMeta, ref: SessionMeta) -> bool:
+    """Whether ``session`` looks like part of the same task as ``ref``.
+
+    A task rarely lives in one session -- you stop for the day, start fresh
+    tomorrow, split work across two windows. What ties those together is
+    concrete overlap: the same repo *and* a shared branch or file, or a shared
+    file even across repos (you were editing the same thing). Same repo alone is
+    too broad to mean "same task".
+    """
+    if session.id == ref.id:
+        return True
+    ref_files = set(ref.files)
+    shares_file = bool(ref_files) and any(path in ref_files for path in session.files)
+    same_repo = bool(ref.repo_key) and session.repo_key == ref.repo_key
+    ref_branches = {b.name for b in ref.branches if b.name not in (None, "HEAD")}
+    shares_branch = any(b.name in ref_branches for b in session.branches)
+    return shares_file or (same_repo and shares_branch)
+
+
 def _sort_key(sort: str):
     """Return a key function for the given sort order."""
     if sort == "recent":
         return lambda hit: -hit.session.ended_at
     if sort == "oldest":
         return lambda hit: hit.session.ended_at
+    if sort == "unfinished":
+        # Sessions left mid-action first, most recent of those on top.
+        return lambda hit: (0 if hit.session.ended_mid_action else 1, -hit.session.ended_at)
     if sort == "turns":
         return lambda hit: (-hit.session.turns, -hit.session.ended_at)
     if sort == "tokens":
@@ -142,13 +167,23 @@ def compute_view(
     current = time.time() if now is None else now
     parsed: ParsedQuery = parse_query(view.query)
 
+    # "Related to" replaces scope as the membership axis: sibling sessions of a
+    # task live in other branches and directories, so honouring scope here would
+    # hide exactly what was asked for.
+    ref = None
+    if view.related_to is not None:
+        ref = next((s for s in sessions if s.id == view.related_to), None)
+
     hits: list[QueryHit] = []
     scoped: list[SessionMeta] = []
 
     for session in sessions:
         if view.hide_empty and session.turns == 0 and session.live is None:
             continue
-        if not _in_scope(session, view, anchor):
+        if ref is not None:
+            if not is_related(session, ref):
+                continue
+        elif not _in_scope(session, view, anchor):
             continue
         scoped.append(session)
         hit = evaluate(session, parsed, current, ctx)
@@ -156,14 +191,13 @@ def compute_view(
             hits.append(hit)
 
     effective_sort = "relevance" if view.sort == "recent" and parsed.free_text else view.sort
-    key = _sort_key(effective_sort)
 
-    if effective_sort == "title":
-        hits.sort(key=key)
-    else:
-        # A running session is nearly always the one you meant; keep it on top
-        # regardless of ordering, except when explicitly sorting by title.
-        hits.sort(key=lambda hit: (0 if hit.session.live else 1, key(hit)))
+    # Running sessions are not floated to the top: a claude process left open in
+    # a terminal for days is not "recent", and hoisting it above a session you
+    # touched minutes ago makes the age column read as mis-sorted. One actively
+    # working ranks first on its own merits, since its transcript is being
+    # written right now; the live dot marks the rest where they belong.
+    hits.sort(key=_sort_key(effective_sort))
 
     return ViewResult(
         hits=hits,

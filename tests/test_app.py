@@ -272,11 +272,25 @@ class Resuming(unittest.TestCase):
         # The skip flag still leads the invocation when forking.
         self.assertEqual(args[0], "--dangerously-skip-permissions")
 
-    def test_ctrl_o_resumes_from_current_directory(self):
+    def test_ctrl_o_resumes_when_the_current_directory_resolves(self):
+        # The real use of ctrl+o: the session's recorded directory is gone, but
+        # you are standing in one that encodes to the same project.
+        gone = session(
+            id="abc", origin_cwd="/gone/place",
+            project_dir="".join(c if c.isalnum() else "-" for c in self.REAL_DIR), cwds=[],
+        )
+        harness = Harness([gone], anchor(cwd=self.REAL_DIR))
+        harness.press("ctrl+o")
+        self.assertEqual(harness.app.action.plan.cwd, self.REAL_DIR)
+
+    def test_ctrl_o_refuses_a_directory_that_cannot_resolve(self):
+        # Resuming from a directory that encodes to a different project is a
+        # guaranteed "No conversation found", so ctrl+o refuses and points at
+        # the directory that works instead of launching a doomed command.
         harness = Harness([self.resumable()], anchor(cwd="/somewhere/else"))
         harness.press("ctrl+o")
-        self.assertEqual(harness.app.action.plan.cwd, "/somewhere/else")
-        self.assertGreater(len(harness.app.action.plan.warnings), 0)
+        self.assertIsNone(harness.app.action)
+        self.assertIn("won't resolve this session", harness.text())
 
     def test_refuses_when_directory_is_gone(self):
         harness = Harness([session(id="abc", origin_cwd="/definitely/not/here")])
@@ -523,6 +537,69 @@ class BodySearch(unittest.TestCase):
             harness.app.settle()
             harness.app.draw()
             self.assertIn("Parent session", harness.text())
+
+
+class RelatedAndOpen(unittest.TestCase):
+    def _pair(self):
+        ref = session(
+            id="ref", ai_title="The auth work",
+            branches=[BranchStat(name="main", count=5, last_seen=NOW)], files=["/repo/api/auth.py"],
+        )
+        sibling = session(
+            id="sib", ai_title="More auth on a branch",
+            branches=[BranchStat(name="feature", count=5, last_seen=NOW)], files=["/repo/api/auth.py"],
+        )
+        stranger = session(
+            id="stranger", ai_title="Unrelated thing",
+            repo_key="/repo/web", repo_name="web", origin_cwd="/repo/web", files=["/repo/web/main.py"],
+        )
+        return ref, sibling, stranger
+
+    def test_alt_r_shows_related_and_esc_clears(self):
+        ref, sibling, stranger = self._pair()
+        harness = Harness([ref, sibling, stranger], anchor_value=anchor())
+        harness.press("tab", "tab", "tab")  # scope:all so all three are visible first
+        self.assertIn("Unrelated thing", harness.text())
+        harness.press("alt+r")  # relate to the top row (ref)
+        self.assertIn("related:", harness.text())
+        self.assertIn("More auth on a branch", harness.text())
+        self.assertNotIn("Unrelated thing", harness.text())
+        harness.press("escape")
+        self.assertNotIn("related:", harness.text())
+        self.assertIn("Unrelated thing", harness.text())
+
+    def test_alt_o_on_missing_directory_reports_gracefully(self):
+        # Fixture cwds do not exist on disk, so no editor is launched.
+        harness = Harness([session(ai_title="Some work")])
+        harness.press("alt+o")
+        self.assertIn("no longer exists", harness.text())
+
+
+class TimeGrouping(unittest.TestCase):
+    def test_headers_appear_under_recent_sort(self):
+        today = session(id="t", ai_title="Fresh work", ended_at=NOW)
+        old = session(id="o", ai_title="Old work", ended_at=NOW - 20 * 86400)
+        harness = Harness([today, old])
+        harness.press("tab", "tab", "tab")
+        text = harness.text()
+        self.assertIn("Today", text)
+        self.assertIn("Past month", text)
+
+    def test_headers_vanish_when_sorted_otherwise(self):
+        today = session(id="t", ai_title="Fresh work", ended_at=NOW)
+        old = session(id="o", ai_title="Old work", ended_at=NOW - 20 * 86400)
+        harness = Harness([today, old])
+        harness.press("tab", "tab", "tab", "ctrl+s")  # off "recent"
+        self.assertNotIn("Past month", harness.text())
+
+    def test_cursor_stays_visible_scrolling_through_groups(self):
+        # Grouping adds header lines; the scroll math must still keep the
+        # selected row on screen.
+        many = [session(id=f"s{i}", ai_title=f"Session {i}", ended_at=NOW - i * 86400) for i in range(40)]
+        harness = Harness(many, rows=16)
+        harness.press("tab", "tab", "tab")
+        harness.press(*["down"] * 30)
+        self.assertIn("Session 30", harness.selected())
 
 
 if __name__ == "__main__":

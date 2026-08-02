@@ -155,6 +155,23 @@ class SessionMeta:
     has_subagents: bool
     #: True when the transcript contains a compaction summary record.
     compacted: bool
+    #: True when the session's last main-thread event was a tool call or its
+    #: result rather than a closing message -- i.e. Claude was mid-action when
+    #: the transcript ended. The "work I left hanging" signal.
+    ended_mid_action: bool = False
+    #: Session id this transcript was forked/continued from, when its early
+    #: records carry a different session id than its own. None for the common
+    #: case. Best-effort: dormant unless Claude Code preserves the parent id.
+    forked_from: str | None = None
+
+    #: Claude's final natural-language message on the main thread -- "where you
+    #: left off". The other half of a session's identity: the prompts say what
+    #: you asked, this says where it ended up. Capped for the index.
+    last_assistant_text: str | None = None
+    #: The last concrete action Claude took, rendered compactly, e.g.
+    #: "Edit view.py" or "Bash: git commit -m …". None when nothing ran.
+    last_action: str | None = None
+
     #: Set when a running process currently owns this session.
     live: LiveSession | None = None
 

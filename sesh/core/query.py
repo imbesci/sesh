@@ -198,6 +198,12 @@ def _haystacks(session: SessionMeta) -> list[str]:
     out.append(session.origin_cwd)
     if session.last_prompt:
         out.append(session.last_prompt)
+    # Where the session ended up -- lets "the one where it committed the auth
+    # fix" match on Claude's own last words, not just what you typed.
+    if session.last_assistant_text:
+        out.append(session.last_assistant_text)
+    if session.last_action:
+        out.append(session.last_action)
     return out
 
 
@@ -250,6 +256,10 @@ def _matches_field(session: SessionMeta, term: QueryTerm, now: float, ctx: Query
             return session.has_subagents
         if flag == "empty":
             return session.turns == 0
+        if flag in ("unfinished", "wip"):
+            return session.ended_mid_action
+        if flag == "fork":
+            return session.forked_from is not None
         return True
     return True
 

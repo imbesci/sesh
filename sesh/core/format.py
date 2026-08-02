@@ -44,6 +44,31 @@ def relative_time(timestamp: float, now: float | None = None) -> str:
     return f"{days // 365}y"
 
 
+def time_bucket(timestamp: float, now: float | None = None) -> str:
+    """Coarse calendar bucket for grouping a recency-sorted list.
+
+    Calendar-day based rather than elapsed-seconds, so a session from 11pm last
+    night reads as "Yesterday" at 9am, not "12h" ago lumped in with today.
+    """
+    if timestamp <= 0:
+        return "Older"
+    current = time.time() if now is None else now
+    day = datetime.fromtimestamp(timestamp).date()
+    today = datetime.fromtimestamp(current).date()
+    delta = (today - day).days
+    if delta <= 0:
+        return "Today"
+    if delta == 1:
+        return "Yesterday"
+    if delta < 7:
+        return "Past week"
+    if delta < 30:
+        return "Past month"
+    if delta < 365:
+        return "Past year"
+    return "Older"
+
+
 def absolute_time(timestamp: float) -> str:
     """Absolute timestamp for the detail pane."""
     if not timestamp:

@@ -8,10 +8,11 @@ import os
 import subprocess
 import sys
 
+from .core.actions import editor_command
 from .core.format import number, relative_time, short_path
 from .core.git import current_branch, main_repo_root, repo_root
 from .core.index_store import load_sessions
-from .core.resume import ResumeError, plan_resume, plan_to_shell, skip_permissions_default
+from .core.resume import ResumeError, best_resume_cwd, plan_resume, plan_to_shell, skip_permissions_default
 from .core.types import SessionMeta, meta_to_dict
 from .core.view import SCOPE_ORDER, Anchor, compute_view, default_view
 from .tui.ansi import Theme, color_supported, paint, set_color_enabled
@@ -24,7 +25,7 @@ query syntax (shared with the picker):
   branch: repo: file: dir: tool: model: id:   facets
   age: after: before:                         time windows
   turns: tokens: records:                     numeric, e.g. turns:>5
-  is:live is:compacted is:subagents           state
+  is:live is:unfinished is:fork               state; also compacted, subagents
   text:"..."                                  full-text search inside transcripts
   'exact  !exclude                            literal substring, negation
 
@@ -33,6 +34,8 @@ examples:
   sesh --safe               same picker, but resume with permission prompts on
   sesh auth redirect        picker with a filter pre-applied
   sesh --last               resume the most recent session here
+  sesh --open               open the best match's directory in $EDITOR
+  sesh is:unfinished        sessions left mid-action
   sesh --list --all         print every session
   sesh 'branch:main age:7d' combine filters
 """
@@ -54,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--json", action="store_true", help="emit matching session metadata as JSON")
     mode.add_argument("--print", dest="print_cmd", action="store_true", help="print the resume command for the best match")
     mode.add_argument("--last", action="store_true", help="resume the most recent matching session")
+    mode.add_argument("--open", dest="open_editor", action="store_true", help="open the best match's directory in $EDITOR")
 
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("-a", "--all", dest="scope_all", action="store_true", help="every session on this machine")
@@ -111,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     set_color_enabled(color_supported() and sys.stdout.isatty())
 
     query = " ".join(args.query)
-    interactive = not (args.list or args.json or args.print_cmd or args.last)
+    interactive = not (args.list or args.json or args.print_cmd or args.last or args.open_editor)
     # --safe wins over the env default; otherwise resume with the skip flag.
     skip_permissions = skip_permissions_default() and not args.safe
     anchor = build_anchor(os.getcwd())
@@ -206,6 +210,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     best = hits[0].session
+
+    if args.open_editor:
+        target = best_resume_cwd(best)
+        if target is None or not target.exists:
+            print(f"sesh: {best.id[:8]}'s directory no longer exists.", file=sys.stderr)
+            return 1
+        command = editor_command(target.cwd)
+        if command is None:
+            print("sesh: no editor found. Set $EDITOR or $VISUAL, or install `code`.", file=sys.stderr)
+            return 1
+        print(paint(f"→ {target.cwd}", fg=Theme.muted), file=sys.stderr)
+        return launch(command[0], command[1:], target.cwd)
+
     try:
         plan = plan_resume(best, skip_permissions=skip_permissions)
     except ResumeError as err:

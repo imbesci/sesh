@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, replace
 
-from ..core.actions import ActionError, TrashEntry, copy_to_clipboard, restore_trash, trash_session
+from ..core.actions import (
+    ActionError,
+    TrashEntry,
+    copy_to_clipboard,
+    editor_command,
+    restore_trash,
+    trash_session,
+)
 from ..core.deep_search import deep_search
 from ..core.format import relative_time, short_path
 from ..core.index_store import refresh_sessions
 from ..core.query import QueryContext, deep_terms, parse_query
-from ..core.resume import ResumeError, ResumePlan, plan_resume, plan_to_shell, skip_permissions_default
+from ..core.resume import (
+    ResumeError,
+    ResumePlan,
+    best_resume_cwd,
+    plan_resume,
+    plan_to_shell,
+    skip_permissions_default,
+)
 from ..core.transcript import TranscriptEntry, load_transcript
 from ..core.types import SessionMeta
 from ..core.view import (
@@ -29,6 +44,7 @@ from ..core.view import (
 from .ansi import Theme, color_supported, fit, paint, set_color_enabled, truncate, two_column
 from .io import ScreenLike, TerminalLike
 from .render import (
+    bucket_header_before,
     compute_layout,
     render_chips,
     render_header,
@@ -410,6 +426,7 @@ class App:
             layout,
             bool(self.view.query.strip()),
             self.now,
+            group_by_time=self._group_by_time(),
         )
 
         if not self.result.hits:
@@ -467,6 +484,14 @@ class App:
         right = paint(f"{short_path(session.origin_cwd, HOME, 34)} ", fg=Theme.faint) if session else ""
         return two_column(left, right, width)
 
+    def _group_by_time(self) -> bool:
+        """Time-bucket headers only make sense on a date-ordered, unfiltered list.
+
+        A query reorders by relevance and an explicit sort by something other
+        than time, so grouping by calendar day would label a scrambled list.
+        """
+        return self.view.sort == "recent" and not self.view.query.strip()
+
     def _ensure_cursor_visible(self, height: int) -> None:
         """Keep the highlighted row on screen.
 
@@ -479,13 +504,15 @@ class App:
             return
 
         has_query = bool(self.view.query.strip())
+        grouping = self._group_by_time()
 
         def height_of(index: int) -> int:
             if not (0 <= index < len(self.result.hits)):
                 return 1
             hit = self.result.hits[index]
             secondary = has_query and hit.highlight is not None and hit.highlight.text != session_label(hit.session)
-            return 2 if secondary else 1
+            header = grouping and bucket_header_before(self.result.hits, index, self.now) is not None
+            return 1 + (1 if secondary else 0) + (1 if header else 0)
 
         while True:
             used = 0
@@ -806,6 +833,11 @@ class App:
                 self.view.query = ""
                 self.query_cursor = 0
                 self.recompute()
+            elif self.view.related_to is not None:
+                self.view.related_to = None
+                self.cursor = self.scroll = 0
+                self.recompute()
+                self.flash("showing all sessions")
             else:
                 self.action = AppResult(kind="quit")
             return
@@ -871,6 +903,9 @@ class App:
                 "hiding sessions with no prompts" if self.view.hide_empty else "showing all sessions"
             )
             return
+        if name == "alt+r":
+            self._toggle_related()
+            return
 
         # --- panes ------------------------------------------------------------
         if name == "ctrl+t":
@@ -908,6 +943,9 @@ class App:
             return
         if name == "alt+u":
             self._undo_delete()
+            return
+        if name == "alt+o":
+            self._open_in_editor()
             return
         if name == "ctrl+l":
             self._hard_refresh()
@@ -1079,6 +1117,57 @@ class App:
         else:
             self.flash("no clipboard tool available", "error")
 
+    def _toggle_related(self) -> None:
+        """Show only sessions that look like part of the current one's task."""
+        if self.view.related_to is not None:
+            self.view.related_to = None
+            self.cursor = self.scroll = 0
+            self.recompute()
+            self.flash("showing all sessions")
+            return
+        session = self.current()
+        if session is None:
+            self.flash("nothing selected", "error")
+            return
+        self.view.related_to = session.id
+        self.cursor = self.scroll = 0
+        self.recompute()
+        count = len(self.result.hits)
+        self.flash(
+            f"{count} session{'' if count == 1 else 's'} related to this one — esc to clear"
+        )
+
+    def _open_in_editor(self) -> None:
+        """Open the selected session's directory in the user's editor.
+
+        Launched detached so a GUI editor (or the OS opener) does not fight the
+        picker for the terminal; a terminal ``$EDITOR`` is the wrong tool here
+        and the user can always resume to get a shell.
+        """
+        session = self.current()
+        if session is None:
+            return
+        target = best_resume_cwd(session)
+        path = target.cwd if target and target.exists else None
+        if not path:
+            self.flash("session's directory no longer exists", "error")
+            return
+        command = editor_command(path)
+        if command is None:
+            self.flash("no editor found ($EDITOR/$VISUAL/code)", "error")
+            return
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as err:
+            self.flash(f"could not open editor: {err}", "error")
+            return
+        self.flash(f"opened {short_path(path, HOME, 40)} in {os.path.basename(command[0])}", "success")
+
     def _confirm_delete(self) -> None:
         session = self.current()
         if session is None:
@@ -1145,7 +1234,8 @@ HELP_LINES = [
     "tab / shift+tab\twiden or narrow the scope: branch → repo → dir → all",
     "ctrl+b\tfilter by branch",
     "ctrl+r\tfilter by project",
-    "ctrl+s\tcycle sort: recent, relevance, prompts, tokens, size, oldest, title",
+    "alt+r\tshow sessions related to this one (same task); esc clears",
+    "ctrl+s\tcycle sort: recent, relevance, unfinished, prompts, tokens, size, oldest, title",
     "ctrl+g\tshow or hide sessions with no prompts",
     "esc\tclear the filter, then quit",
     "",
@@ -1156,7 +1246,7 @@ HELP_LINES = [
     "dir: tool: model:\tworking directory, tool used, model",
     "age:7d after:2026-07-01\ttime windows; also before:",
     "turns:>5 tokens:>100k\tnumeric filters; also records:",
-    "is:live is:compacted\talso is:subagents, is:git, is:empty",
+    "is:live is:unfinished\talso is:compacted, is:subagents, is:fork, is:git, is:empty",
     'text:"cannot read"\tsearch inside full transcripts, not just prompts',
     "'exact  !exclude\tliteral substring, and negation",
     "",
@@ -1168,6 +1258,7 @@ HELP_LINES = [
     "#manage",
     "ctrl+y\tcopy the resume command    alt+y  copy the session id",
     "ctrl+x\tmove a session to trash    alt+u  undo",
+    "alt+o\topen the session's directory in $EDITOR",
     "ctrl+l\treload from disk",
     "",
     "press any key to close",
