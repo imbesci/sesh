@@ -1,0 +1,25 @@
+[project]
+name = "sesh"
+version = "0.2.0"
+description = "An interactive terminal UI for finding and resuming Claude Code sessions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["claude", "claude-code", "tui", "sessions", "resume", "cli"]
+authors = [{ name = "imbesci", email = "imbesci@gmail.com" }]
+# Zero runtime dependencies — standard library only. ripgrep, pbcopy/xclip and
+# the `claude` CLI are optional external programs discovered at runtime.
+dependencies = []
+
+[project.scripts]
+sesh = "sesh.cli:main"
+
+[project.urls]
+Repository = "https://github.com/imbesci/sesh"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sesh*"]

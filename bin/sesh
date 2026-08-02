@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Resolve this script's real location without relying on `readlink -f`, which
+# is absent on stock macOS before 12.3 and on some BSDs.
+set -euo pipefail
+# The name we were invoked as, captured before the symlink walk
+# rewrites it to the real launcher path.
+invoked="$(basename "$0")"
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ $src != /* ]] && src="$dir/$src"
+done
+root="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+python="${SESH_PYTHON:-python3}"
+if ! command -v "$python" >/dev/null 2>&1; then
+  echo "sesh: python3 is required" >&2
+  exit 1
+fi
+
+exec env PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" SESH_PROG="$invoked" "$python" -m sesh "$@"
